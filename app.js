@@ -147,7 +147,7 @@ bot.action('gift_start', async ctx => {
 bot.action('gift_custom_qty', async ctx => {
   await ctx.answerCbQuery(); const st = _gift.get(ctx.from.id);
   if (!st || st.stage!=='pick_pack') return ctx.answerCbQuery('Сначала введите получателя',{show_alert:true});
-  return ctx.reply('Введите нужное количество звёзд числом (от 50 до 1 000 000):');
+  return ctx.reply('Введите нужное количество звёзд числом (от 70 до 1 000 000):');
 });
 bot.action(/gift_(\d+)/, async ctx => {
   await ctx.answerCbQuery(); const st = _gift.get(ctx.from.id);
@@ -175,7 +175,7 @@ bot.on('text', async ctx => {
   // подарок: пользователь ввёл число вместо кнопки
   if (stG?.stage === 'pick_pack' && stG?.gift_to) {
     const stars = parseStars(txt); if (stars) { await createGiftOrder(ctx, stars, stG.gift_to); _gift.delete(ctx.from.id); }
-    else return ctx.reply('Число вне диапазона. Введите от 80 до 1 000 000.');
+    else return ctx.reply('Число вне диапазона. Введите от 70 до 1 000 000.');
     return;
   }
 
@@ -198,13 +198,26 @@ bot.on('text', async ctx => {
         [Markup.button.callback('Назад', 'back_home')]
       ])
     );
+      // 🔔 уведомляем админа
+  if (ADMIN_CHAT_ID) {
+    try {
+      const m = await bot.telegram.sendMessage(
+        Number(ADMIN_CHAT_ID),
+        `🆕 <b>Новый заказ</b>\n🧾 <code>${id}</code>\n⭐ ${stars}\n💸 ${rub}₽ / ${usdt} USDT\n👤 ${uname(ctx.from)}`,
+        { parse_mode: 'HTML' }
+      );
+      qSetAdminId.run(m.message_id, id);
+    } catch (e) {
+      console.error('admin notify (custom qty):', e?.description || e?.message || e);
+    }
+  }
     _flow.delete(ctx.from.id);
   }
 });
 
 function parseStars(s) {
   const n = parseInt(String(s).replace(/\D/g,''), 10);
-  return Number.isFinite(n) && n >= 50 && n <= 1_000_000 ? n : null;
+  return Number.isFinite(n) && n >= 70 && n <= 1_000_000 ? n : null;
 }
 async function createGiftOrder(ctx, stars, giftTo) {
   const { rub, usdt } = calcPrice(stars); const id = uuid();
