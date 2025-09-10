@@ -70,8 +70,8 @@ const qTries = db.prepare(`SELECT try_count FROM delivery_queue WHERE order_id=?
 const qDelQ = db.prepare(`DELETE FROM delivery_queue WHERE order_id=?`);
 
 /* ── UTILS ───────────────────────────────────────── */
-const PACKS = [100, 250, 500, 1000, 2500];
-const calcPrice = s => ({ rub: Math.round(s * 1.52), usdt: +(s * 0.016).toFixed(2) });
+const PACKS = [70, 100, 250, 500, 1000, 2500];
+const calcPrice = s => ({ rub: Math.round(s * 1.8), usdt: +(s * 0.025).toFixed(2) });
 const isSigned = (req, secret) => !!secret && (req.get('X-Sign') || req.get('x-sign')) === secret;
 const uname = (u) => u?.username ? `@${u.username}` : `id:${u?.id}`;
 const adminMsg = (bot, text, o) => ADMIN_CHAT_ID &&
@@ -87,7 +87,7 @@ const mainMenu = (ctx, t='✨ STARFALL — звёзды по приятным ц
     [Markup.button.callback('⭐ Купить себе', 'buy_menu')],
     [Markup.button.callback('🎁 Купить другу', 'gift_start')],
     [Markup.button.url('🛒 Открыть мини-апп', 'https://shop.starsfabrica.store')],
-    [Markup.button.url('🆘 Поддержка', 'https://t.me/your_support')]
+    [Markup.button.url('🆘 Поддержка', 'https://t.me/ttbono')]
   ]));
 
 bot.start(ctx => mainMenu(ctx));
