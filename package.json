@@ -1,0 +1,22 @@
+{
+  "name": "starmarket",
+  "version": "1.0.0",
+  "main": "starmarket.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "async": "^3.2.6",
+    "axios": "^1.11.0",
+    "better-sqlite3": "^11.10.0",
+    "dayjs": "^1.11.18",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "telegraf": "^4.16.3",
+    "uuid": "^11.1.0"
+  }
+}
