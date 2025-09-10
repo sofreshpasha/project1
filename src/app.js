@@ -82,7 +82,7 @@ const bot = new Telegraf(BOT_TOKEN);
 globalThis._gift = globalThis._gift || new Map();      // userId -> {stage:'await_user'|'pick_pack', gift_to}
 globalThis._flow = globalThis._flow || new Map();      // userId -> {wait:'qty_self'}
 
-const mainMenu = (ctx, t='✨ STARFALL — звёзды по приятным ценам.\nВыбери действие:') =>
+const mainMenu = (ctx, t='✨ STARSFABRICA — звёзды по приятным ценам. Себе, друзьям, близким! \nВыбери действие:') =>
   ctx.reply(t, Markup.inlineKeyboard([
     [Markup.button.callback('⭐ Купить себе', 'buy_menu')],
     [Markup.button.callback('🎁 Купить другу', 'gift_start')],
@@ -175,14 +175,14 @@ bot.on('text', async ctx => {
   // подарок: пользователь ввёл число вместо кнопки
   if (stG?.stage === 'pick_pack' && stG?.gift_to) {
     const stars = parseStars(txt); if (stars) { await createGiftOrder(ctx, stars, stG.gift_to); _gift.delete(ctx.from.id); }
-    else return ctx.reply('Число вне диапазона. Введите от 50 до 1 000 000.');
+    else return ctx.reply('Число вне диапазона. Введите от 80 до 1 000 000.');
     return;
   }
 
   // покупка себе: произвольное число
   const stF = _flow.get(ctx.from.id);
   if (stF?.wait === 'qty_self') {
-    const stars = parseStars(txt); if (!stars) return ctx.reply('Число вне диапазона. Введите от 50 до 1 000 000.');
+    const stars = parseStars(txt); if (!stars) return ctx.reply('Число вне диапазона. Введите от 80 до 1 000 000.');
     const { rub, usdt } = calcPrice(stars); const id = uuid();
     qIns.run(id, ctx.from.id, ctx.from.username || '', stars, rub, usdt, 'created', null);
 
