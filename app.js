@@ -12,8 +12,8 @@ import { fileURLToPath } from 'url';
 const {
   BOT_TOKEN, ADMIN_CHAT_ID, PORT = 3000,
   WEBHOOK_SECRET_CRYPTO, WEBHOOK_SECRET_RUB,
-  CHECKOUT_CRYPTO = 'https://pay.example/crypto',
-  CHECKOUT_RUB    = 'https://pay.example/rub',
+  CHECKOUT_CRYPTO,
+  CHECKOUT_RUB,
   DELIVERY_ETA_MIN = 15,
   // ⬇️ новое для СБП (QRManager)
   QRM_BASE, QRM_TOKEN, PUBLIC_BASE, QRM_WEBHOOK_SECRET
@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS delivery_queue(
   order_id TEXT PRIMARY KEY,
   try_count INTEGER DEFAULT 0,
   last_error TEXT,
+  operation_id TEXT NOT NULL,
+  tries INTEGER DEFAULT 0,
+  next_check_at INTEGER
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 `);
@@ -178,6 +181,10 @@ bot.action(/buy_(\d+)/, async ctx => {
   try {
     sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} • ${id}` });
     qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
+    if (sbp.operationId) {
+  db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+    .run(id, sbp.operationId, Date.now() + 15_000); // первая проверка через 15 сек
+}
   } catch (e) {
     console.error('SBP create error:', e.message);
   }
@@ -275,6 +282,10 @@ bot.on('text', async ctx => {
     try {
       sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} • ${id}` });
       qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
+      if (sbp.operationId) {
+  db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+    .run(id, sbp.operationId, Date.now() + 15_000); // первая проверка через 15 сек
+}
     } catch (e) {
       console.error('SBP create error:', e.message);
     }
@@ -330,6 +341,10 @@ async function createGiftOrder(ctx, stars, giftTo) {
   try {
     sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Gift ${stars} • ${id}` });
     qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
+    if (sbp.operationId) {
+  db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+    .run(id, sbp.operationId, Date.now() + 15_000); // первая проверка через 15 сек
+}
   } catch (e) {
     console.error('SBP create error:', e.message);
   }
@@ -485,6 +500,46 @@ setInterval(async ()=>{
     }
   }catch(e){ console.error('worker:',e.message); }
 }, TICK);
+
+//_____WORKER (проверка оплаты авто)
+const SBP_TICK = 10_000;          // каждые 10 сек смотрим, кому пора
+const SBP_MAX_TRIES = 40;         // ~ 7–10 мин максимум
+
+setInterval(async () => {
+  try {
+    const now = Date.now();
+    const rows = db.prepare('SELECT order_id, operation_id, tries FROM sbp_watch WHERE next_check_at <= ? LIMIT 10').all(now);
+    for (const r of rows) {
+      try {
+        const st = await getSbpStatus(r.operation_id);
+        if (st.paid) {
+          await onPaid('RUB', r.order_id, r.operation_id);
+          db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(r.order_id);
+          continue;
+        }
+        const tries = r.tries + 1;
+        // backoff: 15s, 30s, 45s, ... capped ~60s
+        const delay = Math.min(60_000, 15_000 * tries);
+        db.prepare('UPDATE sbp_watch SET tries=?, next_check_at=? WHERE order_id=?')
+          .run(tries, Date.now() + delay, r.order_id);
+
+        if (tries >= SBP_MAX_TRIES) {
+          // перестаём проверять
+          db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(r.order_id);
+        }
+      } catch (e) {
+        console.error('sbp watch check error:', e.message);
+        // проверим позже
+        db.prepare('UPDATE sbp_watch SET next_check_at=? WHERE order_id=?')
+          .run(Date.now() + 30_000, r.order_id);
+      }
+    }
+  } catch (e) {
+    console.error('sbp watch loop:', e.message);
+  }
+}, SBP_TICK);
+
+db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(orderId);
 
 /* ── START ──────────────────────────────────────── */
 const appInstance = app.listen(PORT, ()=>console.log(`HTTP on ${PORT}`));
