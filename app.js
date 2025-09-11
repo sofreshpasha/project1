@@ -452,49 +452,42 @@ app.post('/webhook/sbp', async (req, res) => {
   try {
     const p = req.body || {};
 
-    // разные варианты полей, которые может прислать QRM
     const operationId = p.id || p.operation_id || p.operationId;
     const number      = p.number || p.sbp_number || null;
     const code        = Number(p.operation_status_code ?? p.code ?? p.status_code);
-    const msg         = p.operation_status_msg || p.status || p.message || '';
 
-    if (!operationId) {
-      return res.status(400).json({ ok: false, error: 'missing operation id' });
-    }
+    if (!operationId) return res.status(400).json({ ok:false, error:'missing operation id' });
 
-    // находим заказ по сохранённому operation_id или номеру СБП
+    // ищем заказ по сохранённым данным
     const o = db.prepare(
       'SELECT * FROM orders WHERE sbp_operation_id = ? OR sbp_number = ?'
     ).get(operationId, number);
 
     if (!o) {
-      console.warn('SBP webhook: order not found', { operationId, number, code, msg });
-      return res.json({ ok: true, note: 'order not found' });
+      console.warn('SBP webhook: order not found', { operationId, number, code });
+      return res.json({ ok:true, note:'order not found' });
     }
 
-    // код 5 = Оплачено
-    if (code === 5) {
-      // идемпотентно: если уже "paid"/"delivered" — не повторяем
+    if (code === 5) { // оплачено
       if (o.status !== 'paid' && o.status !== 'delivered') {
-        await onPaid('RUB', o.id, operationId);
+        await onPaid('RUB', o.id, operationId);   // ← тут o.id, не orderId
       }
-      // очищаем резервную очередь автопуллинга
-      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id);
+      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id);  // ← тоже o.id
     } else {
-      // необязательно, но полезно: если пришёл не финальный статус — убедимся,
-      // что заказ в очереди на повторные проверки
+      // не финальный статус — положим в автопуллинг (на всякий случай)
       db.prepare(`
         INSERT OR IGNORE INTO sbp_watch(order_id, operation_id, tries, next_check_at)
         VALUES (?, ?, 0, ?)
-      `).run(o.id, operationId, Date.now() + 15_000);
+      `).run(o.id, operationId, Date.now() + 15000);
     }
 
-    return res.json({ ok: true });
+    res.json({ ok:true });
   } catch (e) {
     console.error('SBP webhook error:', e?.stack || e?.message || e);
-    return res.status(500).json({ ok: false });
+    res.status(500).json({ ok:false });
   }
 });
+
 
 async function onPaid(currency, orderId, txId) {
   qPaid.run(currency, txId||null, orderId);
