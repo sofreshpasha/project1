@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS sbp_watch(
   order_id TEXT PRIMARY KEY,
   operation_id TEXT NOT NULL,
   tries INTEGER DEFAULT 0,
-  next_check_at INTEGER
+  next_check_at INTEGER,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_sbp_watch_next ON sbp_watch(next_check_at);
@@ -100,6 +100,25 @@ const uname = (u) => u?.username ? `@${u.username}` : `id:${u?.id}`;
 const adminMsg = (bot, text, o) => ADMIN_CHAT_ID &&
   bot.telegram.sendMessage(Number(ADMIN_CHAT_ID), text, { parse_mode:'HTML', reply_to_message_id: o?.admin_msg_id }).catch(()=>{});
 
+// убираем «лишние» символы из назначения платежа
+const sanitizePurpose = (s) =>
+  String(s ?? '')
+    .replace(/[^\w\s.,-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 70);
+
+// единая клавиатура оплаты
+const paymentKb = (sbp, id, rub, usdt) => Markup.inlineKeyboard(
+  [
+    sbp?.qrLink ? [Markup.button.url('🏦 Оплатить СБП', sbp.qrLink)] : [],
+    CHECKOUT_RUB ? [Markup.button.url('💳 Оплатить RUB', `${CHECKOUT_RUB}?order=${id}&amount=${rub}`)] : [],
+    CHECKOUT_CRYPTO ? [Markup.button.url('🪙 Оплатить криптой', `${CHECKOUT_CRYPTO}?order=${id}&amount=${usdt}`)] : [],
+    sbp?.operationId ? [Markup.button.callback('🔄 Проверить оплату СБП', `check_sbp_${id}`)] : [],
+    [Markup.button.callback('Назад', 'back_home')]
+  ].filter(r => r.length)
+);
+
 /* ── QRManager client ───────────────────────────── */
 async function qrmRequest(urlPath, { method = 'POST', body } = {}) {
   if (!QRM_BASE || !QRM_TOKEN) throw new Error('QRManager env missing');
@@ -119,28 +138,24 @@ async function qrmRequest(urlPath, { method = 'POST', body } = {}) {
   return res.json();
 }
 
-// создать платёж СБП
-// POST /operations/qr-code/
+// создать платёж СБП — POST /operations/qr-code/
 async function createSbpPayment({ orderId, amountRub, comment }) {
   const payload = {
-    sum: Math.round(amountRub * 100),            // копейки
+    sum: Number(amountRub),                     // QRM ждёт рубли (как в твоём cURL)
     qr_size: 400,
-    payment_purpose: comment || `Order ${orderId}`,
+    payment_purpose: sanitizePurpose(comment || `Order ${orderId}`),
     notification_url: `${PUBLIC_BASE.replace(/\/$/, '')}/webhook/sbp`
   };
   const data = await qrmRequest('/operations/qr-code/', { body: payload });
-
-  const r = data.results || data; // на всякий
+  const r = data.results || data;
   return {
-    operationId: r.operation_id,
-    number:      r.number,
-    qrLink:      r.qr_link || null
+    operationId: r.operation_id || r.operationId,
+    number:      r.number || null,
+    qrLink:      r.qr_link || (r.qr && (r.qr.url || r.qr.link)) || null
   };
 }
 
-
-// статус операции СБП
-// GET /operations/{id}/qr-status/
+// статус операции СБП — GET /operations/{id}/qr-status/
 async function getSbpStatus(operationId) {
   const data = await qrmRequest(`/operations/${operationId}/qr-status/`, { method: 'GET' });
   const r = data.results || data;
@@ -188,25 +203,15 @@ bot.action(/buy_(\d+)/, async ctx => {
   // создаём СБП
   let sbp = {};
   try {
-    sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} • ${id}` });
+    sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} id ${id}` });
     qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
     if (sbp.operationId) {
-  db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
-    .run(id, sbp.operationId, Date.now() + 15_000); // первая проверка через 15 сек
-}
+      db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+        .run(id, sbp.operationId, Date.now() + 15_000);
+    }
   } catch (e) {
     console.error('SBP create error:', e.message);
   }
-
-  const kb = Markup.inlineKeyboard(
-    [
-      sbp.qrLink ? [Markup.button.url('🏦 Оплатить СБП', sbp.qrLink)] : [],
-      [Markup.button.url('💳 Оплатить RUB', `${CHECKOUT_RUB}?order=${id}&amount=${rub}`)],
-      [Markup.button.url('🪙 Оплатить криптой', `${CHECKOUT_CRYPTO}?order=${id}&amount=${usdt}`)],
-      sbp.operationId ? [Markup.button.callback('🔄 Проверить оплату СБП', `check_sbp_${id}`)] : [],
-      [Markup.button.callback('Назад', 'back_home')]
-    ].filter(r => r.length)
-  );
 
   await ctx.editMessageText(
 `✅ Заказ создан
@@ -214,7 +219,7 @@ bot.action(/buy_(\d+)/, async ctx => {
 🧾 Номер: ${id}
 ⭐ Пакет: ${stars} звёзд
 💸 К оплате: ${rub}₽ или ${usdt} USDT`,
-    kb
+    paymentKb(sbp, id, rub, usdt)
   );
 
   if (ADMIN_CHAT_ID) {
@@ -289,25 +294,15 @@ bot.on('text', async ctx => {
     // создаём СБП
     let sbp = {};
     try {
-      sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} • ${id}` });
+      sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} id ${id}` });
       qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
       if (sbp.operationId) {
-  db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
-    .run(id, sbp.operationId, Date.now() + 15_000); // первая проверка через 15 сек
-}
+        db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+          .run(id, sbp.operationId, Date.now() + 15_000);
+      }
     } catch (e) {
       console.error('SBP create error:', e.message);
     }
-
-    const kb = Markup.inlineKeyboard(
-      [
-        sbp.qrLink ? [Markup.button.url('🏦 Оплатить СБП', sbp.qrLink)] : [],
-        [Markup.button.url('💳 Оплатить RUB', `${CHECKOUT_RUB}?order=${id}&amount=${rub}`)],
-        [Markup.button.url('🪙 Оплатить криптой', `${CHECKOUT_CRYPTO}?order=${id}&amount=${usdt}`)],
-        sbp.operationId ? [Markup.button.callback('🔄 Проверить оплату СБП', `check_sbp_${id}`)] : [],
-        [Markup.button.callback('Назад', 'back_home')]
-      ].filter(r => r.length)
-    );
 
     await ctx.reply(
 `✅ Заказ создан
@@ -315,7 +310,7 @@ bot.on('text', async ctx => {
 🧾 Номер: ${id}
 ⭐ Пакет: ${stars} звёзд
 💸 К оплате: ${rub}₽ или ${usdt} USDT`,
-      kb
+      paymentKb(sbp, id, rub, usdt)
     );
 
     // уведомляем админа
@@ -348,25 +343,15 @@ async function createGiftOrder(ctx, stars, giftTo) {
   // создаём СБП для подарка тоже
   let sbp = {};
   try {
-    sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Gift ${stars} • ${id}` });
+    sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Gift ${stars} id ${id}` });
     qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
     if (sbp.operationId) {
-  db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
-    .run(id, sbp.operationId, Date.now() + 15_000); // первая проверка через 15 сек
-}
+      db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+        .run(id, sbp.operationId, Date.now() + 15_000);
+    }
   } catch (e) {
     console.error('SBP create error:', e.message);
   }
-
-  const kb = Markup.inlineKeyboard(
-    [
-      sbp.qrLink ? [Markup.button.url('🏦 Оплатить СБП', sbp.qrLink)] : [],
-      [Markup.button.url('💳 Оплатить RUB', `${CHECKOUT_RUB}?order=${id}&amount=${rub}`)],
-      [Markup.button.url('🪙 Оплатить криптой', `${CHECKOUT_CRYPTO}?order=${id}&amount=${usdt}`)],
-      sbp.operationId ? [Markup.button.callback('🔄 Проверить оплату СБП', `check_sbp_${id}`)] : [],
-      [Markup.button.callback('Назад', 'back_home')]
-    ].filter(r => r.length)
-  );
 
   await ctx.reply(
 `✅ Заказ создан (🎁 для ${giftTo})
@@ -374,7 +359,7 @@ async function createGiftOrder(ctx, stars, giftTo) {
 🧾 Номер: ${id}
 ⭐ Пакет: ${stars} звёзд
 💸 К оплате: ${rub}₽ или ${usdt} USDT`,
-    kb
+    paymentKb(sbp, id, rub, usdt)
   );
 
   if (ADMIN_CHAT_ID) try {
@@ -451,14 +436,12 @@ app.post('/webhook/rub', async (req,res)=>{
 app.post('/webhook/sbp', async (req, res) => {
   try {
     const p = req.body || {};
-
     const operationId = p.id || p.operation_id || p.operationId;
     const number      = p.number || p.sbp_number || null;
     const code        = Number(p.operation_status_code ?? p.code ?? p.status_code);
 
     if (!operationId) return res.status(400).json({ ok:false, error:'missing operation id' });
 
-    // ищем заказ по сохранённым данным
     const o = db.prepare(
       'SELECT * FROM orders WHERE sbp_operation_id = ? OR sbp_number = ?'
     ).get(operationId, number);
@@ -470,11 +453,10 @@ app.post('/webhook/sbp', async (req, res) => {
 
     if (code === 5) { // оплачено
       if (o.status !== 'paid' && o.status !== 'delivered') {
-        await onPaid('RUB', o.id, operationId);     // ⚠️ здесь o.id (а не orderId)
+        await onPaid('RUB', o.id, operationId);
       }
-      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id); // ⚠️ тоже o.id
+      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id);
     } else {
-      // необязательное, но полезное: если статус ещё не финальный — оставим на автопуллинг
       db.prepare(`
         INSERT OR IGNORE INTO sbp_watch(order_id, operation_id, tries, next_check_at)
         VALUES (?, ?, 0, ?)
@@ -488,18 +470,20 @@ app.post('/webhook/sbp', async (req, res) => {
   }
 });
 
-
 async function onPaid(currency, orderId, txId) {
   qPaid.run(currency, txId||null, orderId);
   const o = qGet.get(orderId); if (!o) return;
+
   const paidText =
     `✅ <b>Оплата получена</b>\n` +
     `🧾 <code>${o.id}</code>\n` +
     `⭐ ${o.stars}\n` +
-    `💱 ${currency}\n` +
+    `💱 ${currency} (СБП)\n` +
+    `📌 Статус: paid\n` +
     `👤 ${o.username ? '@'+o.username : 'id:'+o.user_id}\n` +
     (o.gift_to ? `🎁 Получатель: ${o.gift_to}\n` : '') +
     `🧷 <code>${txId || '-'}</code>`;
+
   adminMsg(bot, paidText, o);
 
   try {
@@ -534,8 +518,8 @@ setInterval(async ()=>{
 }, TICK);
 
 //_____WORKER (проверка оплаты авто)
-const SBP_TICK = 10_000;          // каждые 10 сек смотрим, кому пора
-const SBP_MAX_TRIES = 40;         // ~ 7–10 мин максимум
+const SBP_TICK = 10_000;
+const SBP_MAX_TRIES = 40;
 
 setInterval(async () => {
   try {
@@ -550,18 +534,15 @@ setInterval(async () => {
           continue;
         }
         const tries = r.tries + 1;
-        // backoff: 15s, 30s, 45s, ... capped ~60s
-        const delay = Math.min(60_000, 15_000 * tries);
+        const delay = Math.min(60_000, 15_000 * tries); // 15s, 30s, 45s, ... до 60s
         db.prepare('UPDATE sbp_watch SET tries=?, next_check_at=? WHERE order_id=?')
           .run(tries, Date.now() + delay, r.order_id);
 
         if (tries >= SBP_MAX_TRIES) {
-          // перестаём проверять
           db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(r.order_id);
         }
       } catch (e) {
         console.error('sbp watch check error:', e.message);
-        // проверим позже
         db.prepare('UPDATE sbp_watch SET next_check_at=? WHERE order_id=?')
           .run(Date.now() + 30_000, r.order_id);
       }
@@ -570,8 +551,6 @@ setInterval(async () => {
     console.error('sbp watch loop:', e.message);
   }
 }, SBP_TICK);
-
-db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(orderId);
 
 /* ── START ──────────────────────────────────────── */
 const appInstance = app.listen(PORT, ()=>console.log(`HTTP on ${PORT}`));
