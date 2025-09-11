@@ -89,48 +89,51 @@ const adminMsg = (bot, text, o) => ADMIN_CHAT_ID &&
   bot.telegram.sendMessage(Number(ADMIN_CHAT_ID), text, { parse_mode:'HTML', reply_to_message_id: o?.admin_msg_id }).catch(()=>{});
 
 /* ── QRManager client ───────────────────────────── */
-async function qrmRequest(path, { method = 'POST', body } = {}) {
+async function qrmRequest(urlPath, { method = 'POST', body } = {}) {
   if (!QRM_BASE || !QRM_TOKEN) throw new Error('QRManager env missing');
-  const res = await fetch(`${QRM_BASE}${path}`, {
+  const res = await fetch(`${QRM_BASE.replace(/\/$/, '')}${urlPath}`, {
     method,
     headers: {
-      'Authorization': `Bearer ${QRM_TOKEN}`,
-      'Content-Type': 'application/json'
+      'X-Api-Key': QRM_TOKEN,
+      'Accept': 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {})
     },
     body: body ? JSON.stringify(body) : undefined
   });
   if (!res.ok) {
     const t = await res.text().catch(()=> '');
-    throw new Error(`QRManager ${method} ${path} ${res.status}: ${t}`);
+    throw new Error(`QRManager ${method} ${urlPath} ${res.status}: ${t}`);
   }
   return res.json();
 }
 
 // создать платёж СБП
+// POST /operations/qr-code/
 async function createSbpPayment({ orderId, amountRub, comment }) {
-  // Подстрой поля под фактическую схему их API из PDF при необходимости
-  const data = await qrmRequest('/v3/qr/create', {
-    body: {
-      amount: amountRub,
-      currency: 'RUB',
-      orderId,
-      comment: comment || `Order ${orderId}`,
-      lifetime: 900,
-      webhookUrl: `${PUBLIC_BASE}/webhook/sbp`
-    }
-  });
+  const payload = {
+    sum: Math.round(amountRub * 100),            // копейки
+    qr_size: 400,
+    payment_purpose: comment || `Order ${orderId}`,
+    notification_url: `${PUBLIC_BASE.replace(/\/$/, '')}/webhook/sbp`
+  };
+  const data = await qrmRequest('/operations/qr-code/', { body: payload });
+
+  const r = data.results || data; // на всякий
   return {
-    operationId: data.operationId || data.id || data.operation_id,
-    number:      data.number || data.sbpNumber || null,
-    qrLink:      (data.qr && (data.qr.url || data.qr.link)) || data.qrLink || data.qr_url || null
+    operationId: r.operation_id,
+    number:      r.number,
+    qrLink:      r.qr_link || null
   };
 }
 
+
 // статус операции СБП
+// GET /operations/{id}/qr-status/
 async function getSbpStatus(operationId) {
-  const data = await qrmRequest(`/v3/operations/${operationId}`, { method: 'GET' });
-  const status = String(data.status || data.state || '').toUpperCase();
-  return { status, paid: status === 'PAID' };
+  const data = await qrmRequest(`/operations/${operationId}/qr-status/`, { method: 'GET' });
+  const r = data.results || data;
+  const code = Number(r.operation_status_code);
+  return { status: r.operation_status_msg || String(code), paid: code === 5 };
 }
 
 /* ── BOT ─────────────────────────────────────────── */
@@ -423,18 +426,16 @@ app.post('/webhook/rub', async (req,res)=>{
 /* вебхук СБП (QRManager) */
 app.post('/webhook/sbp', async (req, res) => {
   try {
-    if (QRM_WEBHOOK_SECRET) {
-      const sig = req.get('X-Signature') || '';
-      // тут можно сделать валидацию согласно их доке (HMAC и т.д.)
-      // если не прошло: return res.status(401).end('bad signature');
-    }
-    const { operationId, status, orderId } = req.body || {};
-    if (!operationId || !orderId) return res.status(400).json({ ok:false, error:'bad payload' });
+    const { id: operationId, number, operation_status_code, operation_status_msg } = req.body || {};
+    if (!operationId) return res.status(400).json({ ok:false, error:'bad payload' });
 
-    if (String(status || '').toUpperCase() === 'PAID') {
-      await onPaid('RUB', orderId, operationId);
+    // оплачен = код 5
+    if (Number(operation_status_code) === 5) {
+      // найдём заказ по operationId или по number, если ты его сохраняешь
+      const o = db.prepare('SELECT * FROM orders WHERE sbp_operation_id=? OR sbp_number=?').get(operationId, number || null);
+      if (o) await onPaid('RUB', o.id, operationId);
     }
-    res.json({ ok:true });
+    return res.json({ ok:true });
   } catch (e) {
     console.error('SBP webhook error:', e.message);
     res.status(500).json({ ok:false });
