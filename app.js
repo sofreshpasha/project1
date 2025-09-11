@@ -141,7 +141,7 @@ async function qrmRequest(urlPath, { method = 'POST', body } = {}) {
 // создать платёж СБП — POST /operations/qr-code/
 async function createSbpPayment({ orderId, amountRub, comment }) {
   const payload = {
-    sum: Number(amountRub),                     // QRM ждёт рубли (как в твоём cURL)
+    sum: Math.round(Number(amountRub)),                     // QRM ждёт рубли (как в твоём cURL)
     qr_size: 400,
     payment_purpose: sanitizePurpose(comment || `Order ${orderId}`),
     notification_url: `${PUBLIC_BASE.replace(/\/$/, '')}/webhook/sbp`
