@@ -48,12 +48,21 @@ CREATE TABLE IF NOT EXISTS delivery_queue(
   order_id TEXT PRIMARY KEY,
   try_count INTEGER DEFAULT 0,
   last_error TEXT,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+`);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS sbp_watch(
+  order_id TEXT PRIMARY KEY,
   operation_id TEXT NOT NULL,
   tries INTEGER DEFAULT 0,
   next_check_at INTEGER
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_sbp_watch_next ON sbp_watch(next_check_at);
 `);
+
 try { db.exec(`ALTER TABLE orders ADD COLUMN gift_to TEXT`); } catch {}
 try { db.exec(`ALTER TABLE orders ADD COLUMN admin_msg_id INTEGER`); } catch {}
 try { db.exec('ALTER TABLE orders ADD COLUMN sbp_operation_id TEXT'); } catch {}
@@ -441,19 +450,49 @@ app.post('/webhook/rub', async (req,res)=>{
 /* вебхук СБП (QRManager) */
 app.post('/webhook/sbp', async (req, res) => {
   try {
-    const { id: operationId, number, operation_status_code, operation_status_msg } = req.body || {};
-    if (!operationId) return res.status(400).json({ ok:false, error:'bad payload' });
+    const p = req.body || {};
 
-    // оплачен = код 5
-    if (Number(operation_status_code) === 5) {
-      // найдём заказ по operationId или по number, если ты его сохраняешь
-      const o = db.prepare('SELECT * FROM orders WHERE sbp_operation_id=? OR sbp_number=?').get(operationId, number || null);
-      if (o) await onPaid('RUB', o.id, operationId);
+    // разные варианты полей, которые может прислать QRM
+    const operationId = p.id || p.operation_id || p.operationId;
+    const number      = p.number || p.sbp_number || null;
+    const code        = Number(p.operation_status_code ?? p.code ?? p.status_code);
+    const msg         = p.operation_status_msg || p.status || p.message || '';
+
+    if (!operationId) {
+      return res.status(400).json({ ok: false, error: 'missing operation id' });
     }
-    return res.json({ ok:true });
+
+    // находим заказ по сохранённому operation_id или номеру СБП
+    const o = db.prepare(
+      'SELECT * FROM orders WHERE sbp_operation_id = ? OR sbp_number = ?'
+    ).get(operationId, number);
+
+    if (!o) {
+      console.warn('SBP webhook: order not found', { operationId, number, code, msg });
+      return res.json({ ok: true, note: 'order not found' });
+    }
+
+    // код 5 = Оплачено
+    if (code === 5) {
+      // идемпотентно: если уже "paid"/"delivered" — не повторяем
+      if (o.status !== 'paid' && o.status !== 'delivered') {
+        await onPaid('RUB', o.id, operationId);
+      }
+      // очищаем резервную очередь автопуллинга
+      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id);
+    } else {
+      // необязательно, но полезно: если пришёл не финальный статус — убедимся,
+      // что заказ в очереди на повторные проверки
+      db.prepare(`
+        INSERT OR IGNORE INTO sbp_watch(order_id, operation_id, tries, next_check_at)
+        VALUES (?, ?, 0, ?)
+      `).run(o.id, operationId, Date.now() + 15_000);
+    }
+
+    return res.json({ ok: true });
   } catch (e) {
-    console.error('SBP webhook error:', e.message);
-    res.status(500).json({ ok:false });
+    console.error('SBP webhook error:', e?.stack || e?.message || e);
+    return res.status(500).json({ ok: false });
   }
 });
 
