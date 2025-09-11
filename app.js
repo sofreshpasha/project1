@@ -491,7 +491,7 @@ async function onPaid(currency, orderId, txId) {
       o.user_id,
       `✅ Заказ оплачен.\n` +
       (o.gift_to ? `🎁 Подарок будет отправлен: ${o.gift_to}\n` : '') +
-      `Доставка ${o.stars} ⭐ занимает ~${DELIVERY_ETA_MIN} мин. Сообщу, когда завершится.`
+      `Доставка ${o.stars} ⭐ занимает ~${DELIVERY_ETA_MIN} мин. Мы сообщим о фактическом поступлении.`
     );
   } catch {}
 
@@ -507,8 +507,8 @@ setInterval(async ()=>{
     const r=await deliverStars(j);
     if(r.ok){
       qDelivered.run(j.order_id); qDelQ.run(j.order_id);
-      try{ await bot.telegram.sendMessage(j.user_id, `🎉 Доставлено ${j.stars} ⭐. Спасибо!`);}catch{}
-      const o=qGet.get(j.order_id); adminMsg(bot, `✅ <b>Доставка завершена</b>\n🧾 <code>${o.id}</code>\n⭐ ${o.stars}`, o);
+      // try{ await bot.telegram.sendMessage(j.user_id, `🎉 Доставлено ${j.stars} ⭐. Спасибо!`);}catch{}
+      // const o=qGet.get(j.order_id); adminMsg(bot, `✅ <b>Доставка завершена</b>\n🧾 <code>${o.id}</code>\n⭐ ${o.stars}`, o);
     }else{
       qBump.run(r.reason||'unknown', j.order_id);
       const t=qTries.get(j.order_id)?.try_count||0;
