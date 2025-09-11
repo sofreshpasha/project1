@@ -470,11 +470,11 @@ app.post('/webhook/sbp', async (req, res) => {
 
     if (code === 5) { // оплачено
       if (o.status !== 'paid' && o.status !== 'delivered') {
-        await onPaid('RUB', o.id, operationId);   // ← тут o.id, не orderId
+        await onPaid('RUB', o.id, operationId);     // ⚠️ здесь o.id (а не orderId)
       }
-      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id);  // ← тоже o.id
+      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id); // ⚠️ тоже o.id
     } else {
-      // не финальный статус — положим в автопуллинг (на всякий случай)
+      // необязательное, но полезное: если статус ещё не финальный — оставим на автопуллинг
       db.prepare(`
         INSERT OR IGNORE INTO sbp_watch(order_id, operation_id, tries, next_check_at)
         VALUES (?, ?, 0, ?)

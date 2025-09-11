@@ -1,4 +1,5 @@
 {
+  "type": "module",
   "name": "starmarket",
   "version": "1.0.0",
   "main": "starmarket.js",
