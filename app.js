@@ -338,7 +338,11 @@ async function processDeliveryOnce() {
       throw new Error('Пустой получатель: нет username');
     }
 
-    const result = await deliverViaFragment(order.id, Number(order.stars), recipient);
+    const result = await deliverViaFragment({
+  orderId: order.id,
+  stars: Number(order.stars),
+  recipient
+});
     if (!result || !result.ok) {
       const reason = result?.reason || 'Fragment delivery failed';
       throw new Error(reason);

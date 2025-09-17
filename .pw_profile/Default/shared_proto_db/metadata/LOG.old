@@ -1,2 +1,3 @@
-2025/09/17-12:48:55.119 5204a9 Creating DB /Users/pavelpaciorin/Desktop/Starmarket/.pw_profile/Default/shared_proto_db/metadata since it was missing.
-2025/09/17-12:48:55.122 5204a9 Reusing MANIFEST /Users/pavelpaciorin/Desktop/Starmarket/.pw_profile/Default/shared_proto_db/metadata/MANIFEST-000001
+2025/09/17-15:13:14.831 53e56d Reusing MANIFEST /Users/pavelpaciorin/Desktop/Starmarket/.pw_profile/Default/shared_proto_db/metadata/MANIFEST-000001
+2025/09/17-15:13:14.831 53e56d Recovering log #3
+2025/09/17-15:13:14.831 53e56d Reusing old log /Users/pavelpaciorin/Desktop/Starmarket/.pw_profile/Default/shared_proto_db/metadata/000003.log 
