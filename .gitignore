@@ -5,3 +5,9 @@ db/*.sqlite
 db/*.db
 db/*.db-journal
 .pw_profile/
+node_modules/
+.env
+.DS_Store
+dist/
+coverage/
+logs/
