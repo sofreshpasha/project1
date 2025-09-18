@@ -9,6 +9,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 /* ── ENV ─────────────────────────────────────────── */
+const AUTODELIVER = String(process.env.AUTODELIVER) === '1';
 const {
   BOT_TOKEN, ADMIN_CHAT_ID, PORT = 3000,
   WEBHOOK_SECRET_CRYPTO, WEBHOOK_SECRET_RUB,
@@ -495,7 +496,7 @@ async function onPaid(currency, orderId, txId) {
     );
   } catch {}
 
-  qEnq.run(orderId);
+  if (AUTODELIVER) qEnq.run(orderId);
 }
 
 /* ── WORKER (mock delivery) ─────────────────────── */
@@ -518,6 +519,7 @@ setInterval(async ()=>{
 }, TICK);
 
 //_____WORKER (проверка оплаты авто)
+if (AUTODELIVER) {
 const SBP_TICK = 10_000;
 const SBP_MAX_TRIES = 40;
 
@@ -551,6 +553,7 @@ setInterval(async () => {
     console.error('sbp watch loop:', e.message);
   }
 }, SBP_TICK);
+}
 
 /* ── START ──────────────────────────────────────── */
 const appInstance = app.listen(PORT, ()=>console.log(`HTTP on ${PORT}`));

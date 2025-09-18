@@ -1,2 +1,7 @@
 .env
-providers/fragment_cookies.json.pw_profile/
+node_modules/
+logs/
+db/*.sqlite
+db/*.db
+db/*.db-journal
+.pw_profile/
