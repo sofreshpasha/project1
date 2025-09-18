@@ -1,417 +1,560 @@
-// app.js
-// StarsFabrica — Telegram bot + Express + SBP + Autodelivery via Fragment
-// (c) 2025
-
+// app.js — StarFabrica (ESM)
 import 'dotenv/config';
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import Database from 'better-sqlite3';
-import dayjs from 'dayjs';
 import { v4 as uuid } from 'uuid';
+import dayjs from 'dayjs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// === Fragment provider (Playwright) ===
-import { deliverViaFragment } from './providers/fragment.js';
+/* ── ENV ─────────────────────────────────────────── */
+const {
+  BOT_TOKEN, ADMIN_CHAT_ID, PORT = 3000,
+  WEBHOOK_SECRET_CRYPTO, WEBHOOK_SECRET_RUB,
+  CHECKOUT_CRYPTO,
+  CHECKOUT_RUB,
+  DELIVERY_ETA_MIN = 15,
+  // ⬇️ новое для СБП (QRManager)
+  QRM_BASE, QRM_TOKEN, PUBLIC_BASE, QRM_WEBHOOK_SECRET
+} = process.env;
+if (!BOT_TOKEN) { console.error('BOT_TOKEN missing'); process.exit(1); }
 
-// === Paths / init ===
+/* ── DB ──────────────────────────────────────────── */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-const PORT = Number(process.env.PORT || 3000);
-const RUB_PER_STAR = Number(process.env.RUB_PER_STAR || 1.8);
-const AUTODELIVER = String(process.env.AUTODELIVER || '1') === '1';
-
-const PUBLIC_BASE = (process.env.PUBLIC_BASE || '').replace(/\/$/, '');
-const QRM_BASE = (process.env.QRM_BASE || '').replace(/\/$/, '');
-const QRM_TOKEN = process.env.QRM_TOKEN || '';
-
-const WEBHOOK_SECRET_RUB = process.env.WEBHOOK_SECRET_RUB || '';
-const WEBHOOK_SECRET_CRYPTO = process.env.WEBHOOK_SECRET_CRYPTO || '';
-
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
-
-if (!BOT_TOKEN) {
-  console.error('BOT_TOKEN is required');
-  process.exit(1);
-}
-if (!PUBLIC_BASE) {
-  console.error('PUBLIC_BASE is required (external https url for webhooks)');
-  process.exit(1);
-}
-
-// === DB ===
-const dbDir = path.join(__dirname, 'db');
-const dbPath = path.join(dbDir, 'starfall.sqlite');
-await (async () => {
-  await import('node:fs/promises')
-    .then(fs => fs.mkdir(dbDir, { recursive: true }))
-    .catch(() => {});
-})();
-const db = new Database(dbPath);
+const db = new Database(path.join(__dirname, 'db', 'starfall.sqlite'));
+db.pragma('journal_mode = WAL');
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS orders (
+CREATE TABLE IF NOT EXISTS orders(
   id TEXT PRIMARY KEY,
-  user_id TEXT,
+  user_id INTEGER NOT NULL,
   username TEXT,
-  gift_to TEXT,
   stars INTEGER NOT NULL,
-  amount_rub REAL NOT NULL,
-  payment_provider TEXT,
-  payment_id TEXT,
-  status TEXT NOT NULL DEFAULT 'new',  -- new|pending|paid|delivering|delivered|failed|cancelled
-  tx_id TEXT,
-  retries INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  price_rub INTEGER,
+  price_usdt REAL,
+  currency TEXT,
+  status TEXT NOT NULL,
+  provider_tx TEXT,
+  gift_to TEXT,
+  admin_msg_id INTEGER,
+  sbp_operation_id TEXT,
+  sbp_number TEXT,
+  sbp_qr_link TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS delivery_queue(
+  order_id TEXT PRIMARY KEY,
+  try_count INTEGER DEFAULT 0,
+  last_error TEXT,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+`);
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS sbp_watch(
+  order_id TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL,
+  tries INTEGER DEFAULT 0,
+  next_check_at INTEGER,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sbp_watch_next ON sbp_watch(next_check_at);
+`);
+
+try { db.exec(`ALTER TABLE orders ADD COLUMN gift_to TEXT`); } catch {}
+try { db.exec(`ALTER TABLE orders ADD COLUMN admin_msg_id INTEGER`); } catch {}
+try { db.exec('ALTER TABLE orders ADD COLUMN sbp_operation_id TEXT'); } catch {}
+try { db.exec('ALTER TABLE orders ADD COLUMN sbp_number TEXT'); } catch {}
+try { db.exec('ALTER TABLE orders ADD COLUMN sbp_qr_link TEXT'); } catch {}
+
+const qIns = db.prepare(`
+  INSERT INTO orders(id,user_id,username,stars,price_rub,price_usdt,status,gift_to)
+  VALUES (?,?,?,?,?,?,?,?)
+`);
+const qGet = db.prepare(`SELECT * FROM orders WHERE id=?`);
+const qLast = db.prepare(`SELECT id,stars,status,currency,created_at FROM orders ORDER BY created_at DESC LIMIT ?`);
+const qPaid = db.prepare(`UPDATE orders SET status='paid', currency=?, provider_tx=? WHERE id=?`);
+const qDelivered = db.prepare(`UPDATE orders SET status='delivered' WHERE id=?`);
+const qSetAdminId = db.prepare(`UPDATE orders SET admin_msg_id=? WHERE id=?`);
+const qSetSbpInfo = db.prepare(`
+  UPDATE orders SET sbp_operation_id=?, sbp_number=?, sbp_qr_link=? WHERE id=?
+`);
+
+const qEnq = db.prepare(`INSERT OR IGNORE INTO delivery_queue(order_id) VALUES(?)`);
+const qPop = db.prepare(`
+  SELECT q.order_id, o.user_id, o.username, o.gift_to, o.stars, o.admin_msg_id
+  FROM delivery_queue q JOIN orders o ON o.id=q.order_id
+  WHERE o.status='paid' ORDER BY q.updated_at ASC LIMIT 1
+`);
+const qBump = db.prepare(`UPDATE delivery_queue SET try_count=try_count+1,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE order_id=?`);
+const qTries = db.prepare(`SELECT try_count FROM delivery_queue WHERE order_id=?`);
+const qDelQ = db.prepare(`DELETE FROM delivery_queue WHERE order_id=?`);
+
+/* ── UTILS ───────────────────────────────────────── */
+const PACKS = [70, 100, 250, 500, 1000, 2500];
+const calcPrice = s => ({ rub: Math.round(s * 1.8), usdt: +(s * 0.025).toFixed(2) });
+const isSigned = (req, secret) => !!secret && (req.get('X-Sign') || req.get('x-sign')) === secret;
+const uname = (u) => u?.username ? `@${u.username}` : `id:${u?.id}`;
+const adminMsg = (bot, text, o) => ADMIN_CHAT_ID &&
+  bot.telegram.sendMessage(Number(ADMIN_CHAT_ID), text, { parse_mode:'HTML', reply_to_message_id: o?.admin_msg_id }).catch(()=>{});
+
+// убираем «лишние» символы из назначения платежа
+const sanitizePurpose = (s) =>
+  String(s ?? '')
+    .replace(/[^\w\s.,-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 70);
+
+// единая клавиатура оплаты
+const paymentKb = (sbp, id, rub, usdt) => Markup.inlineKeyboard(
+  [
+    sbp?.qrLink ? [Markup.button.url('🏦 Оплатить СБП', sbp.qrLink)] : [],
+    CHECKOUT_RUB ? [Markup.button.url('💳 Оплатить RUB', `${CHECKOUT_RUB}?order=${id}&amount=${rub}`)] : [],
+    CHECKOUT_CRYPTO ? [Markup.button.url('🪙 Оплатить криптой', `${CHECKOUT_CRYPTO}?order=${id}&amount=${usdt}`)] : [],
+    sbp?.operationId ? [Markup.button.callback('🔄 Проверить оплату СБП', `check_sbp_${id}`)] : [],
+    [Markup.button.callback('Назад', 'back_home')]
+  ].filter(r => r.length)
 );
 
-CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-`);
-
-const insOrder = db.prepare(`
-  INSERT INTO orders (id, user_id, username, gift_to, stars, amount_rub, payment_provider, payment_id, status, created_at, updated_at)
-  VALUES (@id, @user_id, @username, @gift_to, @stars, @amount_rub, @payment_provider, @payment_id, @status, @created_at, @updated_at)
-`);
-
-const updStatus = db.prepare(`
-  UPDATE orders SET status=@status, updated_at=@updated_at WHERE id=@id
-`);
-const setPaid = db.prepare(`
-  UPDATE orders SET status='paid', tx_id=@tx_id, updated_at=@updated_at WHERE id=@id
-`);
-const setDelivering = db.prepare(`
-  UPDATE orders SET status='delivering', retries=retries+1, updated_at=@updated_at WHERE id=@id
-`);
-const setDelivered = db.prepare(`
-  UPDATE orders SET status='delivered', tx_id=@tx_id, updated_at=@updated_at WHERE id=@id
-`);
-const setFailed = db.prepare(`
-  UPDATE orders SET status='failed', updated_at=@updated_at WHERE id=@id
-`);
-const findById = db.prepare(`SELECT * FROM orders WHERE id=?`);
-const nextPaidForDelivery = db.prepare(`
-  SELECT * FROM orders
-  WHERE status='paid' OR (status='delivering' AND retries<5)
-  ORDER BY updated_at ASC
-  LIMIT 1
-`);
-
-// === Helpers ===
-const now = () => dayjs().toISOString();
-const calcAmountRub = (stars) => Math.round(stars * RUB_PER_STAR * 100) / 100;
-
-function signOk(req, secret) {
-  if (!secret) return false;
-  const header = req.get('X-Sign') || '';
-  return header === secret; // упрощённо, без HMAC, по твоей текущей логике
-}
-
-async function createSbpInvoice(orderId, amountRub) {
-  // Создание QR/инвойса в QRManager
-  // Используем минимальный универсальный формат: notification_url должен указывать на наш вебхук.
-  const url = `${QRM_BASE}/api/invoice/create`;
-  const body = {
-    amount: amountRub,
-    currency: 'RUB',
-    order_id: orderId,
-    notification_url: `${PUBLIC_BASE}/webhook/sbp`,
-    description: `StarsFabrica #${orderId}`
-  };
-
-  const res = await fetch(url, {
-    method: 'POST',
+/* ── QRManager client ───────────────────────────── */
+async function qrmRequest(urlPath, { method = 'POST', body } = {}) {
+  if (!QRM_BASE || !QRM_TOKEN) throw new Error('QRManager env missing');
+  const res = await fetch(`${QRM_BASE.replace(/\/$/, '')}${urlPath}`, {
+    method,
     headers: {
-      'Authorization': `Bearer ${QRM_TOKEN}`,
-      'Content-Type': 'application/json'
+      'X-Api-Key': QRM_TOKEN,
+      'Accept': 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {})
     },
-    body: JSON.stringify(body)
+    body: body ? JSON.stringify(body) : undefined
   });
-
   if (!res.ok) {
-    const text = await res.text().catch(()=> '');
-    throw new Error(`QRManager create failed: ${res.status} ${text}`);
+    const t = await res.text().catch(()=> '');
+    throw new Error(`QRManager ${method} ${urlPath} ${res.status}: ${t}`);
   }
-  const data = await res.json();
-  // ожидаем { invoice_id, pay_url, qr_base64, ... }
+  return res.json();
+}
+
+// создать платёж СБП — POST /operations/qr-code/
+async function createSbpPayment({ orderId, amountRub, comment }) {
+  const payload = {
+    sum: Math.round(Number(amountRub)*100),                     // QRM ждёт рубли (как в твоём cURL)
+    qr_size: 400,
+    payment_purpose: sanitizePurpose(comment || `Order ${orderId}`),
+    notification_url: `${PUBLIC_BASE.replace(/\/$/, '')}/webhook/sbp`
+  };
+  const data = await qrmRequest('/operations/qr-code/', { body: payload });
+  const r = data.results || data;
   return {
-    invoiceId: data.invoice_id || data.id || orderId,
-    payUrl: data.pay_url || data.url || null,
-    qrBase64: data.qr_base64 || null
+    operationId: r.operation_id || r.operationId,
+    number:      r.number || null,
+    qrLink:      r.qr_link || (r.qr && (r.qr.url || r.qr.link)) || null
   };
 }
 
-// === Telegram Bot ===
+// статус операции СБП — GET /operations/{id}/qr-status/
+async function getSbpStatus(operationId) {
+  const data = await qrmRequest(`/operations/${operationId}/qr-status/`, { method: 'GET' });
+  const r = data.results || data;
+  const code = Number(r.operation_status_code);
+  return { status: r.operation_status_msg || String(code), paid: code === 5 };
+}
+
+/* ── BOT ─────────────────────────────────────────── */
 const bot = new Telegraf(BOT_TOKEN);
+globalThis._gift = globalThis._gift || new Map();      // userId -> {stage:'await_user'|'pick_pack', gift_to}
+globalThis._flow = globalThis._flow || new Map();      // userId -> {wait:'qty_self'}
 
-const PACKS = [
-  { name: '⭐ 50', stars: 50 },
-  { name: '⭐ 100', stars: 100 },
-  { name: '⭐ 250', stars: 250 },
-  { name: '⭐ 500', stars: 500 },
-];
+const mainMenu = (ctx, t='✨ STARSFABRICA — звёзды по приятным ценам. Себе, друзьям, близким! \nВыбери действие:') =>
+  ctx.reply(t, Markup.inlineKeyboard([
+    [Markup.button.callback('⭐ Купить себе', 'buy_menu')],
+    [Markup.button.callback('🎁 Купить другу', 'gift_start')],
+    [Markup.button.url('🛒 Открыть мини-апп', 'https://shop.starsfabrica.store')],
+    [Markup.button.url('🆘 Поддержка', 'https://t.me/ttbono')]
+  ]));
 
-bot.start(async (ctx) => {
-  const kb = Markup.keyboard([['Купить себе'], ['Подарить звезды']]).resize();
-  await ctx.reply('Привет! Это StarsFabrica. Выбери действие:', kb);
+bot.start(ctx => mainMenu(ctx));
+
+/* меню покупки себе */
+bot.action('buy_menu', ctx => {
+  const rows = [
+    [Markup.button.callback('🔢 Другое количество', 'custom_qty_self')],
+    ...PACKS.map(p => [Markup.button.callback(`✨ ${p} звёзд`, `buy_${p}`)]),
+    [Markup.button.callback('Назад', 'back_home')]
+  ];
+  return ctx.editMessageText('⭐ Выбери пакет или нажми «Другое количество»:',
+    Markup.inlineKeyboard(rows));
 });
 
-bot.hears('Купить себе', async (ctx) => {
-  const buttons = PACKS.map(p =>
-    [Markup.button.callback(`${p.name} — ${calcAmountRub(p.stars)}₽`, `buy:${p.stars}`)]
+bot.action('back_home', async ctx => { try { await ctx.deleteMessage(); } catch {} return mainMenu(ctx,'◀️ Вернулись назад.'); });
+
+/* покупка себе — фикс пакеты */
+bot.action(/buy_(\d+)/, async ctx => {
+  await ctx.answerCbQuery();
+  const stars = +ctx.match[1];
+  const { rub, usdt } = calcPrice(stars);
+  const id = uuid();
+
+  qIns.run(id, ctx.from.id, ctx.from.username || '', stars, rub, usdt, 'created', null);
+
+  // создаём СБП
+  let sbp = {};
+  try {
+    sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} id ${id}` });
+    qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
+    if (sbp.operationId) {
+      db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+        .run(id, sbp.operationId, Date.now() + 15_000);
+    }
+  } catch (e) {
+    console.error('SBP create error:', e.message);
+  }
+
+  await ctx.editMessageText(
+`✅ Заказ создан
+
+🧾 Номер: ${id}
+⭐ Пакет: ${stars} звёзд
+💸 К оплате: ${rub}₽ или ${usdt} USDT`,
+    paymentKb(sbp, id, rub, usdt)
   );
-  await ctx.reply('Выбери пакет:', Markup.inlineKeyboard(buttons));
-});
 
-bot.action(/buy:(\d+)/, async (ctx) => {
-  try {
-    await ctx.answerCbQuery();
-    const stars = Number(ctx.match[1]);
-    const amount = calcAmountRub(stars);
-    const id = uuid();
-
-    // создаём инвойс в QRManager
-    const inv = await createSbpInvoice(id, amount);
-
-    // сохраняем заказ
-    insOrder.run({
-      id,
-      user_id: String(ctx.from.id),
-      username: ctx.from.username || '',
-      gift_to: '',
-      stars,
-      amount_rub: amount,
-      payment_provider: 'sbp',
-      payment_id: inv.invoiceId,
-      status: 'pending',
-      created_at: now(),
-      updated_at: now()
-    });
-
-    const payText = [
-      `Заказ #${id}`,
-      `Пакет: ${stars} ⭐`,
-      `К оплате: ${amount} ₽`,
-      '',
-      inv.payUrl ? `Оплатить: ${inv.payUrl}` : 'Сканируйте QR для оплаты.',
-      '',
-      'После оплаты дождитесь подтверждения.'
-    ].join('\n');
-
-    if (inv.qrBase64) {
-      const buf = Buffer.from(inv.qrBase64, 'base64');
-      await ctx.replyWithPhoto({ source: buf }, { caption: payText });
-    } else {
-      await ctx.reply(payText);
-    }
-
-    if (ADMIN_CHAT_ID) {
-      await bot.telegram.sendMessage(
-        ADMIN_CHAT_ID,
-        `🆕 Новый заказ #${id}\nПользователь: @${ctx.from.username || ctx.from.id}\n${stars}⭐ = ${amount}₽`
+  if (ADMIN_CHAT_ID) {
+    try {
+      const m = await bot.telegram.sendMessage(
+        Number(ADMIN_CHAT_ID),
+        `🆕 <b>Новый заказ</b>\n🧾 <code>${id}</code>\n⭐ ${stars}\n💸 ${rub}₽ / ${usdt} USDT\n👤 ${uname(ctx.from)}`,
+        { parse_mode:'HTML' }
       );
-    }
-  } catch (e) {
-    console.error('buy error:', e);
-    await ctx.reply('Не удалось создать счёт. Попробуйте позже.');
+      qSetAdminId.run(m.message_id, id);
+    } catch {}
   }
 });
 
-// подарки (упрощённо)
-bot.hears('Подарить звезды', async (ctx) => {
-  await ctx.reply('Пока в этой версии подарки оформляем вручную — напишите @админу, кого хотите поздравить 😊');
+/* покупка себе — произвольное количество */
+bot.action('custom_qty_self', async ctx => {
+  await ctx.answerCbQuery(); _flow.set(ctx.from.id, { wait: 'qty_self' });
+  return ctx.reply('Введите количество звёзд числом (от 70 до 1 000 000):',
+    Markup.inlineKeyboard([[Markup.button.callback('Назад', 'back_home')]]));
 });
 
-// === Web server ===
-const app = express();
-app.use(express.json({ limit: '1mb' }));
+/* подарок — поток */
+bot.action('gift_start', async ctx => {
+  await ctx.answerCbQuery(); _gift.set(ctx.from.id, { stage: 'await_user' });
+  return ctx.reply('🎁 Введите @юзернейм друга (или его ID):',
+    Markup.inlineKeyboard([[Markup.button.callback('Назад', 'back_home')]]));
+});
+bot.action('gift_custom_qty', async ctx => {
+  await ctx.answerCbQuery(); const st = _gift.get(ctx.from.id);
+  if (!st || st.stage!=='pick_pack') return ctx.answerCbQuery('Сначала введите получателя',{show_alert:true});
+  return ctx.reply('Введите нужное количество звёзд числом (от 70 до 1 000 000):');
+});
+bot.action(/gift_(\d+)/, async ctx => {
+  await ctx.answerCbQuery(); const st = _gift.get(ctx.from.id);
+  if (!st || st.stage!=='pick_pack' || !st.gift_to) return ctx.answerCbQuery('Сначала введите получателя',{show_alert:true});
+  await createGiftOrder(ctx, +ctx.match[1], st.gift_to); _gift.delete(ctx.from.id);
+});
 
-// health
-app.get('/health', (_req, res) => res.status(200).send('ok'));
+/* универсальный приём текста: получатель подарка / произвольное число */
+bot.on('text', async ctx => {
+  const txt = (ctx.message.text || '').trim();
 
-// --- Webhooks ---
-// Универсальный «чекаут РУБ»
-app.post('/webhook/rub', async (req, res) => {
+  // подарок: ввод получателя
+  const stG = _gift.get(ctx.from.id);
+  if (stG?.stage === 'await_user') {
+    _gift.set(ctx.from.id, { stage: 'pick_pack', gift_to: txt });
+    const rows = [
+      [Markup.button.callback('🔢 Другое количество', 'gift_custom_qty')],
+      ...PACKS.map(p => [Markup.button.callback(`✨ ${p} звёзд`, `gift_${p}`)]),
+      [Markup.button.callback('Назад', 'back_home')]
+    ];
+    return ctx.reply(`Ок! 🎉 Покупаем звёзды для ${txt}. Выберите пакет или введите своё количество:`,
+      Markup.inlineKeyboard(rows));
+  }
+
+  // подарок: пользователь ввёл число вместо кнопки
+  if (stG?.stage === 'pick_pack' && stG?.gift_to) {
+    const stars = parseStars(txt);
+    if (stars) { await createGiftOrder(ctx, stars, stG.gift_to); _gift.delete(ctx.from.id); }
+    else return ctx.reply('Число вне диапазона. Введите от 70 до 1 000 000.');
+    return;
+  }
+
+  // покупка себе: произвольное число
+  const stF = _flow.get(ctx.from.id);
+  if (stF?.wait === 'qty_self') {
+    const stars = parseStars(txt); if (!stars) return ctx.reply('Число вне диапазона. Введите от 70 до 1 000 000.');
+    const { rub, usdt } = calcPrice(stars); const id = uuid();
+
+    qIns.run(id, ctx.from.id, ctx.from.username || '', stars, rub, usdt, 'created', null);
+
+    // создаём СБП
+    let sbp = {};
+    try {
+      sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Stars ${stars} id ${id}` });
+      qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
+      if (sbp.operationId) {
+        db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+          .run(id, sbp.operationId, Date.now() + 15_000);
+      }
+    } catch (e) {
+      console.error('SBP create error:', e.message);
+    }
+
+    await ctx.reply(
+`✅ Заказ создан
+
+🧾 Номер: ${id}
+⭐ Пакет: ${stars} звёзд
+💸 К оплате: ${rub}₽ или ${usdt} USDT`,
+      paymentKb(sbp, id, rub, usdt)
+    );
+
+    // уведомляем админа
+    if (ADMIN_CHAT_ID) {
+      try {
+        const m = await bot.telegram.sendMessage(
+          Number(ADMIN_CHAT_ID),
+          `🆕 <b>Новый заказ</b>\n🧾 <code>${id}</code>\n⭐ ${stars}\n💸 ${rub}₽ / ${usdt} USDT\n👤 ${uname(ctx.from)}`,
+          { parse_mode: 'HTML' }
+        );
+        qSetAdminId.run(m.message_id, id);
+      } catch (e) {
+        console.error('admin notify (custom qty):', e?.description || e?.message || e);
+      }
+    }
+
+    _flow.delete(ctx.from.id);
+  }
+});
+
+function parseStars(s) {
+  const n = parseInt(String(s).replace(/\D/g,''), 10);
+  return Number.isFinite(n) && n >= 70 && n <= 1_000_000 ? n : null;
+}
+
+async function createGiftOrder(ctx, stars, giftTo) {
+  const { rub, usdt } = calcPrice(stars); const id = uuid();
+  qIns.run(id, ctx.from.id, ctx.from.username || '', stars, rub, usdt, 'created', giftTo);
+
+  // создаём СБП для подарка тоже
+  let sbp = {};
   try {
-    if (!signOk(req, WEBHOOK_SECRET_RUB)) return res.status(403).send('forbidden');
-    const { orderId, status, txId } = req.body || {};
-    if (!orderId) return res.status(400).send('no orderId');
-
-    const order = findById.get(orderId);
-    if (!order) return res.status(404).send('not found');
-
-    if (status === 'paid' && order.status !== 'paid' && order.status !== 'delivered') {
-      setPaid.run({ id: orderId, tx_id: txId || 'paid', updated_at: now() });
-      await notifyPaid(orderId);
+    sbp = await createSbpPayment({ orderId: id, amountRub: rub, comment: `Gift ${stars} id ${id}` });
+    qSetSbpInfo.run(sbp.operationId || null, sbp.number || null, sbp.qrLink || null, id);
+    if (sbp.operationId) {
+      db.prepare('INSERT OR REPLACE INTO sbp_watch(order_id, operation_id, tries, next_check_at) VALUES (?,?,0,?)')
+        .run(id, sbp.operationId, Date.now() + 15_000);
     }
-    res.json({ ok: true });
   } catch (e) {
-    console.error('webhook/rub error', e);
-    res.status(500).json({ ok: false });
+    console.error('SBP create error:', e.message);
   }
-});
 
-// Крипто провайдер (если используешь)
-app.post('/webhook/crypto', async (req, res) => {
+  await ctx.reply(
+`✅ Заказ создан (🎁 для ${giftTo})
+
+🧾 Номер: ${id}
+⭐ Пакет: ${stars} звёзд
+💸 К оплате: ${rub}₽ или ${usdt} USDT`,
+    paymentKb(sbp, id, rub, usdt)
+  );
+
+  if (ADMIN_CHAT_ID) try {
+    const m = await bot.telegram.sendMessage(Number(ADMIN_CHAT_ID),
+      `🆕 <b>Новый заказ (ПОДАРОК)</b>\n🧾 <code>${id}</code>\n⭐ ${stars}\n💸 ${rub}₽ / ${usdt} USDT\n👤 ${uname(ctx.from)}\n🎁 Получатель: ${giftTo}`, { parse_mode:'HTML' });
+    qSetAdminId.run(m.message_id, id);
+  } catch {}
+}
+
+/* проверка СБП вручную */
+bot.action(/check_sbp_(.+)/, async ctx => {
+  await ctx.answerCbQuery();
+  const orderId = ctx.match[1];
+  const o = qGet.get(orderId);
+  if (!o) return ctx.reply('⛔ Заказ не найден');
+  if (!o.sbp_operation_id) return ctx.reply('Для заказа нет операции СБП');
+
   try {
-    if (!signOk(req, WEBHOOK_SECRET_CRYPTO)) return res.status(403).send('forbidden');
-    const { orderId, status, txId } = req.body || {};
-    if (!orderId) return res.status(400).send('no orderId');
-
-    const order = findById.get(orderId);
-    if (!order) return res.status(404).send('not found');
-
-    if (status === 'paid' && order.status !== 'paid' && order.status !== 'delivered') {
-      setPaid.run({ id: orderId, tx_id: txId || 'paid', updated_at: now() });
-      await notifyPaid(orderId);
+    const st = await getSbpStatus(o.sbp_operation_id);
+    if (st.paid) {
+      await onPaid('RUB', orderId, o.sbp_operation_id);
+      return ctx.reply('✅ Оплата по СБП подтверждена. Спасибо!');
     }
-    res.json({ ok: true });
+    return ctx.reply(`Статус: ${st.status || 'UNKNOWN'}. Если уже оплачивали — повторите проверку позже.`);
   } catch (e) {
-    console.error('webhook/crypto error', e);
-    res.status(500).json({ ok: false });
+    console.error('SBP status error:', e.message);
+    return ctx.reply('Не удалось проверить статус. Попробуйте позднее.');
   }
 });
 
-// Webhook от QRManager (СБП)
+/* мини-админ */
+bot.command('last', ctx => {
+  if (String(ctx.from.id) !== String(ADMIN_CHAT_ID)) return;
+  const rows = qLast.all(5);
+  if (!rows.length) return ctx.reply('Пока пусто');
+  ctx.reply(rows.map(o => `🧾 <code>${o.id}</code>\n⭐ ${o.stars}\n💳 ${o.status}${o.currency?` (${o.currency})`:''}\n🕒 ${dayjs(o.created_at).format('YYYY-MM-DD HH:mm')}`)
+    .join('\n\n'), { parse_mode:'HTML' });
+});
+bot.command('o', ctx => {
+  const [, id] = (ctx.message.text||'').split(/\s+/,2);
+  if (!id) return ctx.reply('Usage: /o <orderId>');
+  const o = qGet.get(id); if (!o) return ctx.reply('⛔ Не найдено');
+  ctx.reply([
+    `🧾 ID: ${o.id}`,
+    `⭐ Звёзд: ${o.stars}`,
+    `💳 Статус: ${o.status}${o.currency?` (${o.currency})`:''}`,
+    o.provider_tx ? `🧷 Tx: ${o.provider_tx}` : null,
+    o.gift_to ? `🎁 Получатель: ${o.gift_to}` : null,
+    `🕒 ${dayjs(o.created_at).format('YYYY-MM-DD HH:mm')}`
+  ].filter(Boolean).join('\n'));
+});
+
+/* ── HTTP ────────────────────────────────────────── */
+const app = express(); app.use(express.json());
+app.get('/health', (_,res)=>res.json({ok:true,ts:Date.now()}));
+
+app.post('/webhook/crypto', async (req,res)=>{
+  if (!isSigned(req, WEBHOOK_SECRET_CRYPTO)) return res.status(401).end('Unauthorized');
+  const { orderId, status, txId } = req.body || {};
+  if (!orderId) return res.status(400).json({ ok:false, error:'orderId required' });
+  if (status === 'paid') await onPaid('USDT', orderId, txId);
+  res.json({ok:true});
+});
+
+app.post('/webhook/rub', async (req,res)=>{
+  if (!isSigned(req, WEBHOOK_SECRET_RUB)) return res.status(401).end('Unauthorized');
+  const { orderId, status, txId } = req.body || {};
+  if (!orderId) return res.status(400).json({ ok:false, error:'orderId required' });
+  if (status === 'paid') await onPaid('RUB', orderId, txId);
+  res.json({ok:true});
+});
+
+/* вебхук СБП (QRManager) */
 app.post('/webhook/sbp', async (req, res) => {
   try {
-    const { order_id, status, tx_id } = req.body || {};
-    if (!order_id) return res.status(400).send('no order_id');
+    const p = req.body || {};
+    const operationId = p.id || p.operation_id || p.operationId;
+    const number      = p.number || p.sbp_number || null;
+    const code        = Number(p.operation_status_code ?? p.code ?? p.status_code);
 
-    const order = findById.get(order_id);
-    if (!order) return res.status(404).send('not found');
+    if (!operationId) return res.status(400).json({ ok:false, error:'missing operation id' });
 
-    if (String(status).toLowerCase() === 'paid' && order.status !== 'paid' && order.status !== 'delivered') {
-      setPaid.run({ id: order_id, tx_id: tx_id || 'paid', updated_at: now() });
-      await notifyPaid(order_id);
+    const o = db.prepare(
+      'SELECT * FROM orders WHERE sbp_operation_id = ? OR sbp_number = ?'
+    ).get(operationId, number);
+
+    if (!o) {
+      console.warn('SBP webhook: order not found', { operationId, number, code });
+      return res.json({ ok:true, note:'order not found' });
     }
-    res.json({ ok: true });
+
+    if (code === 5) { // оплачено
+      if (o.status !== 'paid' && o.status !== 'delivered') {
+        await onPaid('RUB', o.id, operationId);
+      }
+      db.prepare('DELETE FROM sbp_watch WHERE order_id = ?').run(o.id);
+    } else {
+      db.prepare(`
+        INSERT OR IGNORE INTO sbp_watch(order_id, operation_id, tries, next_check_at)
+        VALUES (?, ?, 0, ?)
+      `).run(o.id, operationId, Date.now() + 15000);
+    }
+
+    res.json({ ok:true });
   } catch (e) {
-    console.error('webhook/sbp error', e);
-    res.status(500).json({ ok: false });
+    console.error('SBP webhook error:', e?.stack || e?.message || e);
+    res.status(500).json({ ok:false });
   }
 });
 
-// === Notify helpers ===
-async function notifyPaid(orderId) {
-  const o = findById.get(orderId);
-  if (!o) return;
-  const userId = Number(o.user_id);
+async function onPaid(currency, orderId, txId) {
+  qPaid.run(currency, txId||null, orderId);
+  const o = qGet.get(orderId); if (!o) return;
 
-  // пользователю
+  const paidText =
+    `✅ <b>Оплата получена</b>\n` +
+    `🧾 <code>${o.id}</code>\n` +
+    `⭐ ${o.stars}\n` +
+    `💱 ${currency} (СБП)\n` +
+    `📌 Статус: paid\n` +
+    `👤 ${o.username ? '@'+o.username : 'id:'+o.user_id}\n` +
+    (o.gift_to ? `🎁 Получатель: ${o.gift_to}\n` : '') +
+    `🧷 <code>${txId || '-'}</code>`;
+
+  adminMsg(bot, paidText, o);
+
   try {
     await bot.telegram.sendMessage(
-      userId,
-      `✅ Оплата получена.\nЗаказ #${o.id}\n${o.stars}⭐\nЗапускаем доставку…`
+      o.user_id,
+      `✅ Заказ оплачен.\n` +
+      (o.gift_to ? `🎁 Подарок будет отправлен: ${o.gift_to}\n` : '') +
+      `Доставка ${o.stars} ⭐ занимает ~${DELIVERY_ETA_MIN} мин. Мы сообщим о фактическом поступлении.`
     );
   } catch {}
 
-  // админу
-  if (ADMIN_CHAT_ID) {
-    try {
-      await bot.telegram.sendMessage(
-        ADMIN_CHAT_ID,
-        `💳 Оплачен заказ #${o.id} (${o.stars}⭐, ${o.amount_rub}₽).`
-      );
-    } catch {}
-  }
+  qEnq.run(orderId);
 }
 
-// === Delivery worker (Fragment) ===
-async function processDeliveryOnce() {
-  // берём ближайший заказ к доставке
-  const order = nextPaidForDelivery.get();
-  if (!order) return;
+/* ── WORKER (mock delivery) ─────────────────────── */
+async function deliverStars(job){ await new Promise(r=>setTimeout(r,1500)); return {ok:true}; }
+const TICK=5000, MAX_TRIES=8;
+setInterval(async ()=>{
+  try{
+    const j=qPop.get(); if(!j) return;
+    const r=await deliverStars(j);
+    if(r.ok){
+      qDelivered.run(j.order_id); qDelQ.run(j.order_id);
+      // try{ await bot.telegram.sendMessage(j.user_id, `🎉 Доставлено ${j.stars} ⭐. Спасибо!`);}catch{}
+      // const o=qGet.get(j.order_id); adminMsg(bot, `✅ <b>Доставка завершена</b>\n🧾 <code>${o.id}</code>\n⭐ ${o.stars}`, o);
+    }else{
+      qBump.run(r.reason||'unknown', j.order_id);
+      const t=qTries.get(j.order_id)?.try_count||0;
+      if(t>=MAX_TRIES){ adminMsg(bot, `⛔ Не удалось доставить <code>${j.order_id}</code> (${t} попыток)`, j); qDelQ.run(j.order_id); }
+    }
+  }catch(e){ console.error('worker:',e.message); }
+}, TICK);
 
-  // если уже доставляется — дадим ещё попытку (<=5)
+//_____WORKER (проверка оплаты авто)
+const SBP_TICK = 10_000;
+const SBP_MAX_TRIES = 40;
+
+setInterval(async () => {
   try {
-    setDelivering.run({ id: order.id, updated_at: now() });
-
-    // получатель: свой username (если не подарок)
-    const recipient = (order.gift_to && order.gift_to.trim())
-      ? order.gift_to.trim().replace(/^@/, '')
-      : (order.username || '').replace(/^@/, '');
-
-    if (!recipient) {
-      throw new Error('Пустой получатель: нет username');
-    }
-
-    const result = await deliverViaFragment({
-  orderId: order.id,
-  stars: Number(order.stars),
-  recipient
-});
-    if (!result || !result.ok) {
-      const reason = result?.reason || 'Fragment delivery failed';
-      throw new Error(reason);
-    }
-
-    // успех
-    setDelivered.run({ id: order.id, tx_id: result.tx || 'fragment', updated_at: now() });
-
-    // нотификация пользователю
-    try {
-      await bot.telegram.sendMessage(
-        Number(order.user_id),
-        `🎉 Доставлено!\nЗаказ #${order.id}\nНачислено: ${order.stars}⭐\nTX: ${result.tx || 'n/a'}`
-      );
-    } catch {}
-
-    // админу
-    if (ADMIN_CHAT_ID) {
+    const now = Date.now();
+    const rows = db.prepare('SELECT order_id, operation_id, tries FROM sbp_watch WHERE next_check_at <= ? LIMIT 10').all(now);
+    for (const r of rows) {
       try {
-        await bot.telegram.sendMessage(
-          ADMIN_CHAT_ID,
-          `🚀 Доставлено: #${order.id} → @${recipient} (${order.stars}⭐)\nTX: ${result.tx || 'n/a'}`
-        );
-      } catch {}
+        const st = await getSbpStatus(r.operation_id);
+        if (st.paid) {
+          await onPaid('RUB', r.order_id, r.operation_id);
+          db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(r.order_id);
+          continue;
+        }
+        const tries = r.tries + 1;
+        const delay = Math.min(60_000, 15_000 * tries); // 15s, 30s, 45s, ... до 60s
+        db.prepare('UPDATE sbp_watch SET tries=?, next_check_at=? WHERE order_id=?')
+          .run(tries, Date.now() + delay, r.order_id);
+
+        if (tries >= SBP_MAX_TRIES) {
+          db.prepare('DELETE FROM sbp_watch WHERE order_id=?').run(r.order_id);
+        }
+      } catch (e) {
+        console.error('sbp watch check error:', e.message);
+        db.prepare('UPDATE sbp_watch SET next_check_at=? WHERE order_id=?')
+          .run(Date.now() + 30_000, r.order_id);
+      }
     }
   } catch (e) {
-    console.error('delivery error:', e?.message || e);
-
-    const current = findById.get(order.id);
-    if (!current) return;
-
-    if (current.retries >= 4) {
-      // фатал
-      setFailed.run({ id: order.id, updated_at: now() });
-      try {
-        await bot.telegram.sendMessage(
-          Number(current.user_id),
-          `⚠️ Не удалось доставить заказ #${current.id}. Мы уже разбираемся и вернёмся с решением.`
-        );
-      } catch {}
-      if (ADMIN_CHAT_ID) {
-        await bot.telegram.sendMessage(
-          ADMIN_CHAT_ID,
-          `❌ FAIL доставка #${current.id}: ${e.message}`
-        ).catch(()=>{});
-      }
-    } else {
-      // оставляем статус 'delivering' с увеличенным retries — на следующем цикле попробуем снова
-      if (ADMIN_CHAT_ID) {
-        await bot.telegram.sendMessage(
-          ADMIN_CHAT_ID,
-          `♻️ Ретрай доставки #${current.id} (${current.retries+1}/5): ${e.message}`
-        ).catch(()=>{});
-      }
-    }
+    console.error('sbp watch loop:', e.message);
   }
-}
+}, SBP_TICK);
 
-// Цикл воркера
-if (AUTODELIVER) {
-  setInterval(processDeliveryOnce, 7000);
-}
+/* ── START ──────────────────────────────────────── */
+const appInstance = app.listen(PORT, ()=>console.log(`HTTP on ${PORT}`));
+bot.launch().then(()=>console.log('Bot polling started'));
+process.once('SIGINT', ()=>{ bot.stop('SIGINT'); appInstance.close(); });
+process.once('SIGTERM', ()=>{ bot.stop('SIGTERM'); appInstance.close(); });
 
-// === Start ===
-app.listen(PORT, () => {
-  console.log(`HTTP on :${PORT}`);
-});
-bot.launch().then(() => console.log('Bot launched')).catch(console.error);
-
-// корректное завершение
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
