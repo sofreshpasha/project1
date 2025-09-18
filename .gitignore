@@ -11,3 +11,9 @@ node_modules/
 dist/
 coverage/
 logs/
+node_modules/
+.env
+.DS_Store
+dist/
+logs/
+coverage/
